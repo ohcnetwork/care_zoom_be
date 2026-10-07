@@ -97,7 +97,7 @@ class AppointmentView(AppointmentBaseView):
             reason = ZoomUnavailable.default_detail
         slot = booking.token_slot
         doctor = slot.resource.user
-        return Response(
+        response = Response(
             {
                 "booking_id": booking.external_id,
                 "status": booking.status,
@@ -117,6 +117,12 @@ class AppointmentView(AppointmentBaseView):
                 "configured": is_configured,
             }
         )
+        if not self.patient:
+            response.data["staff_context"] = {
+                "facility_id": slot.resource.facility.external_id,
+                "patient_id": booking.patient.external_id,
+            }
+        return response
 
 
 class AppointmentTokenView(AppointmentBaseView):

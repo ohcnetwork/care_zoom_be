@@ -1,5 +1,7 @@
 # care_zoom
 
+Current implementation, setup and remaining work: [implementation handoff](./IMPLEMENTATION.md).
+
 Stateless Zoom Video SDK calls for CARE practitioner appointments. Requires CARE revision
 `3fe704930d9b2d7b6ffdc212cbf6a6a72bfaede4` and the companion `care_zoom_fe` frontend.
 
@@ -39,7 +41,7 @@ Zoom JWT. Keep the secret out of frontend environment, source control and logs. 
 region is a connection preference, not a guarantee of end-to-end data residency.
 
 For this workspace, store local credentials in ignored
-`/Users/gigin/care_zoom/.env`; backend and Celery load it through the external
+`/Users/gigin/care_scaffold/care/care_zoom/.env`; backend and Celery load it through the external
 Compose override. Recreate services after changing environment configuration:
 
 ```bash

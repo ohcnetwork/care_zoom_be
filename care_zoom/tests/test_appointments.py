@@ -102,6 +102,7 @@ class AppointmentTests(CareAPITestBase):
     def assert_denied_without_token(self, response, status):
         self.assertEqual(response.status_code, status, response.data)
         self.assertNotIn("token", response.data)
+        self.assertNotIn("staff_context", response.data)
         self.assertEqual(response["Cache-Control"], "no-store")
 
     def claims(self, response):
@@ -162,6 +163,24 @@ class AppointmentTests(CareAPITestBase):
         self.assertFalse(response.data["can_join"])
         self.assertEqual(response.data["caller_role"], "observer")
         self.assert_denied_without_token(self.client.post(self.url(token=True)), 403)
+
+    def test_staff_route_context_is_only_returned_to_authorized_staff(self):
+        for user in (self.doctor, self.other):
+            with self.subTest(user=user.username):
+                self.staff(user)
+                response = self.client.get(self.url())
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["staff_context"],
+                    {
+                        "facility_id": str(self.facility.external_id),
+                        "patient_id": str(self.patient.external_id),
+                    },
+                )
+        self.otp()
+        response = self.client.get(self.url(otp=True))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("staff_context", response.data)
 
     def test_assigned_practitioner_also_needs_booking_read_permission(self):
         self.doctor.facilityorganizationuser_set.all().delete()
