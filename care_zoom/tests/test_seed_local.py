@@ -83,8 +83,10 @@ class LocalSeedTests(CareAPITestBase):
         self.assertEqual(data["patient"]["date_of_birth"], "1990-01-01")
         availability = booking.token_slot.availability
         schedule = availability.schedule
+        self.assertTrue(schedule.meta["care_zoom"]["video_enabled"])
+        schedule.meta = {"other_plugin": {"kept": True}, "care_zoom": {"kept": 1}}
         schedule.external_id = fixture_id("schedule")
-        schedule.save(update_fields=["external_id"])
+        schedule.save(update_fields=["external_id", "meta"])
         availability.availability = {}
         availability.reason = None
         availability.save(update_fields=["availability", "reason"])
@@ -108,6 +110,13 @@ class LocalSeedTests(CareAPITestBase):
         self.assertEqual(data["patient"]["gender"], "male")
         self.assertEqual(data["patient"]["date_of_birth"], "1990-01-01")
         schedule.refresh_from_db()
+        self.assertEqual(
+            schedule.meta,
+            {
+                "other_plugin": {"kept": True},
+                "care_zoom": {"kept": 1, "video_enabled": True},
+            },
+        )
         self.assertEqual(schedule.external_id.version, 4)
         self.assertEqual(booking.token_slot.availability.schedule_id, schedule.pk)
         self.assertEqual(Schedule.objects.count(), 1)

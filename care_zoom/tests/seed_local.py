@@ -112,6 +112,8 @@ def seed():
             "valid_to": now + timedelta(days=1),
         },
     )
+    schedule.meta.setdefault("care_zoom", {})["video_enabled"] = True
+    schedule.save(update_fields=["meta"])
     availability_data = AvailabilityForScheduleSpec(
         name="Zoom verification",
         slot_type="appointment",

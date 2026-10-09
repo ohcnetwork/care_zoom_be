@@ -52,6 +52,7 @@ class AppointmentTests(CareAPITestBase):
             valid_from=self.now - timedelta(days=1),
             valid_to=self.now + timedelta(days=1),
             is_public=True,
+            meta={"care_zoom": {"video_enabled": True}},
         )
         self.availability = Availability.objects.create(
             schedule=self.schedule,
@@ -328,11 +329,38 @@ class AppointmentTests(CareAPITestBase):
                 obj.deleted = False
                 obj.save(update_fields=["deleted"])
 
-    def test_no_availability_or_encounter_is_required(self):
-        self.slot.availability = None
-        self.slot.save(update_fields=["availability"])
+    def test_no_encounter_is_required_but_availability_is(self):
         self.assertIsNone(self.booking.associated_encounter_id)
         self.assertEqual(self.client.post(self.url(token=True)).status_code, 200)
+        self.slot.availability = None
+        self.slot.save(update_fields=["availability"])
+        for otp in (False, True):
+            self.otp() if otp else self.staff(self.doctor)
+            self.assertFalse(self.client.get(self.url(otp=otp)).data["eligible"])
+            self.assert_denied_without_token(
+                self.client.post(self.url(otp=otp, token=True)), 400
+            )
+
+    def test_non_video_schedules_cannot_issue_tokens_for_either_role(self):
+        for meta in (
+            {},
+            {"care_zoom": {"video_enabled": False}},
+            {"care_zoom": {"video_enabled": "true"}},
+            {"care_zoom": {"video_enabled": 1}},
+            {"care_zoom": True},
+            [],
+        ):
+            self.schedule.meta = meta
+            self.schedule.save(update_fields=["meta"])
+            for otp in (False, True):
+                with self.subTest(meta=meta, otp=otp):
+                    self.otp() if otp else self.staff(self.doctor)
+                    response = self.client.get(self.url(otp=otp))
+                    self.assertFalse(response.data["eligible"])
+                    self.assertFalse(response.data["can_join"])
+                    self.assert_denied_without_token(
+                        self.client.post(self.url(otp=otp, token=True)), 400
+                    )
 
     def test_missing_or_inactive_practitioner_cannot_issue_tokens(self):
         self.otp()

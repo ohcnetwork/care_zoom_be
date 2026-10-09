@@ -1,5 +1,6 @@
-"""Four read-only/token routes. Nothing writes appointment or encounter state."""
+"""Schedule video settings and appointment authorization; no booking state writes."""
 
+from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -8,13 +9,19 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from care.emr.models.scheduling.booking import TokenBooking
+from care.emr.models.scheduling.schedule import Schedule
 from care.security.authorization import AuthorizationController
+from care.utils.lock import Lock
+from care_zoom.appointments import (
+    configured,
+    eligibility,
+    mint_token,
+    schedule_video_enabled,
+)
 from config.patient_otp_authentication import (
     JWTTokenPatientAuthentication,
     OTPAuthenticatedPermission,
 )
-
-from care_zoom.appointments import configured, eligibility, mint_token
 
 
 class ZoomUnavailable(APIException):
@@ -22,14 +29,80 @@ class ZoomUnavailable(APIException):
     default_detail = "Video appointments are not configured. Contact your care team."
 
 
-class AppointmentBaseView(APIView):
-    patient = False
-
+class ZoomBaseView(APIView):
     def finalize_response(self, request, response, *args, **kwargs):
         response = super().finalize_response(request, response, *args, **kwargs)
         response["Cache-Control"] = "no-store"
         response["Pragma"] = "no-cache"
         return response
+
+
+class ScheduleVideoView(ZoomBaseView):
+    def get_schedule(self, request, facility_id, schedule_id):
+        if request.user.deleted or not request.user.is_active:
+            raise PermissionDenied("Your staff account is inactive.")
+        schedule = get_object_or_404(
+            Schedule.objects.select_related("resource__user", "resource__facility"),
+            external_id=schedule_id,
+            deleted=False,
+            resource__deleted=False,
+            resource__resource_type="practitioner",
+            resource__user__deleted=False,
+            resource__user__is_active=True,
+            resource__facility__external_id=facility_id,
+            resource__facility__deleted=False,
+        )
+        permission = (
+            "can_write_schedule" if request.method == "PATCH" else "can_list_schedule"
+        )
+        if not AuthorizationController.call(
+            permission, schedule.resource, request.user
+        ):
+            raise PermissionDenied(
+                "You do not have permission to access this schedule."
+            )
+        return schedule
+
+    def get(self, request, facility_id, schedule_id):
+        schedule = self.get_schedule(request, facility_id, schedule_id)
+        return Response(
+            {
+                "schedule_id": schedule.external_id,
+                "video_enabled": schedule_video_enabled(schedule),
+            }
+        )
+
+    def patch(self, request, facility_id, schedule_id):
+        schedule = self.get_schedule(request, facility_id, schedule_id)
+        if (
+            not isinstance(request.data, dict)
+            or type(request.data.get("video_enabled")) is not bool
+        ):
+            raise ValidationError({"video_enabled": "A boolean is required."})
+        with Lock(f"booking:resource:{schedule.resource_id}"), transaction.atomic():
+            schedule = get_object_or_404(
+                Schedule.objects.select_for_update(), pk=schedule.pk, deleted=False
+            )
+            meta = schedule.meta
+            if not isinstance(meta, dict) or not isinstance(
+                meta.get("care_zoom", {}), dict
+            ):
+                raise ValidationError("Schedule metadata must contain JSON objects.")
+            meta.setdefault("care_zoom", {})["video_enabled"] = request.data[
+                "video_enabled"
+            ]
+            schedule.updated_by = request.user
+            schedule.save(update_fields=["meta", "updated_by", "modified_date"])
+        return Response(
+            {
+                "schedule_id": schedule.external_id,
+                "video_enabled": schedule_video_enabled(schedule),
+            }
+        )
+
+
+class AppointmentBaseView(ZoomBaseView):
+    patient = False
 
     def get_booking(self, request, booking_id):
         # Related default managers do not filter soft-deleted rows in JOINs.

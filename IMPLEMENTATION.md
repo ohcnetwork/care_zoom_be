@@ -1,6 +1,6 @@
 # CARE Zoom v1 — implementation handoff
 
-Last updated: 7 October 2026. This is the starting point for continuing the Zoom plugin in a new
+Last updated: 8 October 2026. This is the starting point for continuing the Zoom plugin in a new
 session. Read the workspace `AGENTS.md`, then `skills/care-plugin-architecture/SKILL.md`, before
 editing. The verified v1 baseline works with the core revisions below; newer working-tree
 additions are identified separately. Live two-party audio/video and mobile acceptance remain open.
@@ -67,13 +67,13 @@ acceptance of the concurrent feature additions described below.
 
 ## Implemented scope and product behavior
 
-This is a stateless **appointment-bound** integration with Zoom Video SDK. CARE's existing
-`TokenBooking` is the appointment. There is no separate Video Consultation model, scheduling
+This is an **appointment-bound** integration with Zoom Video SDK, without persisted call
+sessions. CARE's existing `TokenBooking` is the appointment. There is no separate Video Consultation model, scheduling
 system or persistence layer. A stable same-origin `/teleconsult/<booking_uuid>` URL is shared by
 staff and patients; newer working-tree code redirects authorized staff to the facility appointment
 route described below. Joining/leaving never changes appointment or encounter state;
-an encounter is not required. All otherwise eligible practitioner bookings are supported; v1
-does not require a separate video-enabled flag on availability.
+an encounter is not required. Video requires an explicit opt-in for the booking's whole schedule,
+as described below.
 
 The UI is **custom CARE-styled React UI using `@zoom/videosdk` 2.5.0**, not Zoom's prebuilt UI
 Toolkit or the Zoom Meeting SDK. It loads the SDK lazily after **Prepare for call**. It includes
@@ -94,6 +94,27 @@ video actions to feel part of Appointments. The panel was the initial fallback f
 slots; this patient-panel concern has not been resolved by the newer staff-page changes. Inspect current extension points and
 `.agent/zoom-original-build-request.txt` before deciding how to integrate existing appointment cards. Do
 not treat a separate consultation workflow as a requirement or modify core to add a slot.
+
+### Schedule consultation mode (8 October 2026)
+
+- A whole practitioner schedule is **In person** by default or **Video call** when
+  `Schedule.meta["care_zoom"]["video_enabled"]` is the boolean `true`. No availability override,
+  booking snapshot, plugin model, migration or signal is added. The flag contains no credentials.
+- The plugin's `EditScheduleTemplateSheet` override retains the native Edit component through
+  `__base` and adds **Consultation mode** beside it. The dialog explains that saving applies to
+  all existing and future bookings under the schedule. Different modes use separate schedules.
+- `PatientInfoCard` groups its original `children` with Join/Copy actions, preserving native
+  Check-In, permissions and menus. Join is shown to the assigned practitioner for eligible video
+  appointments; booking-read staff can copy the link. In-person appointments show no Zoom actions.
+- Shared backend eligibility rejects in-person appointments and bookings without schedule
+  availability for staff and patient token requests, including direct links. Existing schedules
+  require explicit opt-in. The DEBUG fixture seed enables only its synthetic Zoom schedule.
+- Changing mode affects subsequent authorization; it does not revoke an issued Zoom token or
+  disconnect an active call. Joining still does not check in or change appointment status.
+- All application changes belong to the two plugin repositories. The host override allowlist
+  changes only in external `.agent/frontend.env`; **zero tracked core changes** are required.
+
+Current schedule-mode checks and earlier baseline results are recorded separately below.
 
 ### Concurrent work observed at handoff
 
@@ -125,11 +146,13 @@ do not create a separate consultation model or change the plugin's appointment-w
 ## Backend contract
 
 Source: `care_zoom/appointments.py` owns shared eligibility/JWT construction;
-`care_zoom/views.py` owns record filtering and access; `care_zoom/urls.py` exposes four routes.
+`care_zoom/views.py` owns record filtering and access; `care_zoom/urls.py` exposes the routes.
 All are beneath `/api/care_zoom/`, with `Authorization: Bearer <CARE token>`:
 
 | Method / route | Required access |
 | --- | --- |
+| `GET facility/<facility_uuid>/schedules/<schedule_uuid>/video/` | Staff JWT plus core `can_list_schedule(resource, user)` |
+| `PATCH facility/<facility_uuid>/schedules/<schedule_uuid>/video/` | Staff JWT plus core `can_write_schedule(resource, user)` |
 | `GET appointments/<uuid>/` | Staff JWT plus core `can_list_booking(resource, user)` |
 | `POST appointments/<uuid>/token/` | Same, plus staff is the assigned active practitioner |
 | `GET otp/appointments/<uuid>/` | Core `JWTTokenPatientAuthentication` and `OTPAuthenticatedPermission`, matching appointment patient phone |
@@ -140,12 +163,19 @@ patient records sharing the OTP-authenticated phone follow core's existing share
 model. The backend derives display identity, session, role and user key from current records;
 clients cannot supply overrides. POST has no required body.
 
+Schedule GET/PATCH return `schedule_id` and `video_enabled`. PATCH requires a JSON boolean in
+`video_enabled`, preserves unrelated metadata and records the modifying staff user. The schedule
+must belong to the requested facility and an active practitioner resource; patient OTP tokens
+cannot use this endpoint. Only an explicit boolean `true` enables video, including when reading
+older or malformed metadata.
+
 - Eligible statuses: `booked`, `arrived`, `checked_in`, `in_consultation`.
-- Required resource: practitioner, active assigned user, valid positive slot interval.
+- Required resource: practitioner, active assigned user, valid positive slot interval and
+  availability under an explicitly video-enabled schedule.
 - Token issuance window: **15 minutes before slot start through 60 minutes after slot end**,
   including both exact boundary instants.
 - Soft-deleted booking, patient, slot, resource, facility, assigned user, and any present
-  availability/schedule relationship are rejected. Availability itself need not exist.
+  availability/schedule relationship are rejected. Missing availability makes video ineligible.
 - Missing/non-practitioner/deleted records and another patient phone return 404; unauthorized
   staff return 403; state/time-window rejection returns 400; disabled/unconfigured Zoom returns
   503. Missing credentials leave metadata readable with `configured=false`, `can_join=false`.
@@ -154,7 +184,7 @@ clients cannot supply overrides. POST has no required body.
 GET returns booking/status/names/slot times, `join_opens_at`, `join_closes_at`, `join_path`,
 `eligible`, `can_join`, `caller_role` (`host`, `participant`, `observer`), `reason`, `configured`.
 The newer working-tree staff response also includes `staff_context` as described above.
-`eligible` describes resource/status validity; `can_join` also considers clock, role and setup.
+`eligible` describes schedule/resource/status validity; `can_join` also considers clock, role and setup.
 POST returns `token`, `session_name`, `session_key`, `display_name`, `role`, `expires_at`.
 
 JWTs use HS256 and backend-only Video SDK credentials. Session name is `care-<booking_uuid>`;
@@ -166,17 +196,18 @@ only when configured. Browser Zoom tokens stay in memory, never storage, links o
 Reauthorization occurs on each new token request. Reassignment prevents the former host from
 getting another token; rescheduling creates a new booking/link and the old `rescheduled` booking
 cannot get a token. **Already issued tokens and running calls are not revoked** by appointment
-changes. Host End ends the current session; eligible callers can start another afterward.
+or schedule-mode changes. Host End ends the current session; eligible callers can start another afterward.
 
 ## Frontend integration and source map
 
-`src/manifest.tsx` is the sole federation export. It registers staff routes and three existing
+`src/manifest.tsx` is the sole federation export. It registers staff routes and four existing
 core overrides. Every wrapper preserves the injected `__base` implementation.
 
 | File | Responsibility |
 | --- | --- |
-| `src/components/PatientInfoCard.tsx` | Preserve original props/children and add appointment actions only for `tagEntityType="appointment"` |
-| `src/components/AppointmentActions.tsx` | Staff Join/Copy actions backed by plugin metadata |
+| `src/components/PatientInfoCard.tsx` | Preserve original props and group native action children with Zoom actions only for `tagEntityType="appointment"` |
+| `src/components/AppointmentActions.tsx` | Eligible video appointment Join/Copy actions beside native controls; assigned-practitioner Join |
+| `src/components/ScheduleVideoSettings.tsx` | Override `EditScheduleTemplateSheet`, preserve native Edit and add the schedule-wide consultation-mode dialog |
 | `src/components/PatientPortalIndex.tsx` | Existing portal plus video-appointments panel; phone-scoped pagination and in-progress bookings |
 | `src/components/PublicRouter.tsx`, `src/utils/routes.ts` | Strict UUID call route; preserve other public routes; core patient-router fallback supports OTP patients |
 | `src/pages/CallPage.tsx` | Auth branches, metadata, prejoin/call lifecycle and login return |
@@ -260,12 +291,13 @@ After editing backend credential env values, recreate backend/Celery through the
 
 ```dotenv
 REACT_ENABLED_APPS=ohcnetwork/care_zoom_fe@localhost:25418/assets/remoteEntry.js
-REACT_MFE_REGISTERED_COMPONENTS=PatientInfoCard,PatientPortalIndex,PublicRouter
+REACT_MFE_REGISTERED_COMPONENTS=PatientInfoCard,PatientPortalIndex,PublicRouter,EditScheduleTemplateSheet
 ```
 
 The host launcher supplies `REACT_CARE_API_URL` and its explicit strict port. The override
 allowlist is applied at host startup/build time. The build-time remote registration is necessary
-for the call URL to work before login.
+for the call URL to work before login. Restart the host after changing this allowlist; a remote
+rebuild alone does not register a new host override.
 
 ## Local fixtures and repeatable checks
 
@@ -285,6 +317,8 @@ cd /Users/gigin/care_scaffold
 
 The seed is never run at startup. It maintains stable fixture booking/patient/facility IDs,
 repairs invalid old synthetic data, and preserves existing note/identifier/demographic values.
+It explicitly enables video on its synthetic schedule, preserving other metadata; it does not
+opt in ordinary schedules. Running it again restores video for that fixture if it was disabled.
 The schedule's legacy UUID5 external ID was converted in place to UUID4 to satisfy core's
 availability-create validator; the stable call URL did not change.
 
@@ -301,16 +335,36 @@ CARE_FE_URL=http://localhost:25417 PLAYWRIGHT_CHANNEL=chrome npm run test:host
 CARE_FE_URL=http://localhost:25417 PLAYWRIGHT_CHANNEL=chrome npm run test:host:live
 ```
 
-Django creates a separate test database. `test:host` uses API fixtures against the real host;
-`test:host:live` uses actual staff login and API responses without resetting the database,
-changing appointment status or requesting a Zoom token. Authentication traces are disabled in
-the latter. Installed Chrome is selected above; otherwise install Playwright's matching browser.
+Django creates a separate test database. `test:host` uses API fixtures against the real host.
+`test:host:live` uses actual staff login and API responses, temporarily switches only the synthetic
+Zoom schedule to in person, and restores its original flag in `finally`. It does not reset the
+database, change appointment status or request a Zoom token. Authentication traces are disabled
+in the latter. Installed Chrome is selected above; otherwise install Playwright's matching browser.
 
-## Verification evidence and bugs already fixed
+## Schedule-mode verification — 8 October 2026
+
+- Backend: **34 tests passed**, including schedule permissions, strict booleans, metadata
+  preservation, missing availability and in-person token rejection for both roles. Migration
+  check reported no changes.
+- Frontend: **58 unit tests passed**; a focused **18-test rerun** passed after clearing stale
+  eligibility on metadata polling failures. TypeScript and production build passed.
+- Chrome against the pinned host: **7 mocked-API scenarios passed**, including adjacent
+  appointment actions and the native Check-In request; **1 real-backend scenario passed**,
+  saving in-person mode through the dialog, verifying existing appointment Zoom actions disappear,
+  restoring the fixture's prior flag and verifying Join returns.
+- Desktop (1280 px) and mobile (390 px) screenshots were inspected; no horizontal overflow was
+  found. Evidence: `.agent/output/playwright/zoom-schedule-video-appointment.png`,
+  `zoom-schedule-video-appointment-mobile.png`, `zoom-schedule-video-settings.png` and
+  `zoom-schedule-video-settings-mobile.png`. The commands above reproduce these checks.
+- Tracked core backend and frontend files remained unchanged. No live two-party audio/video,
+  mobile-device media or automatic PiP acceptance was performed for this change.
+
+## Historical verification evidence and bugs already fixed
 
 Evidence is recorded in `.agent/zoom-verification.md`, `.agent/zoom-backend-tests.log`,
 `.agent/zoom-migration-check.log`, `.agent/output/playwright/`, and frontend `test-results/`.
-Do not infer live-media acceptance from mocked tests or historic logs.
+These are the 7 October baseline results. Do not infer live-media acceptance or verification of
+the 8 October schedule-mode change from mocked tests or historic logs.
 
 - **24 backend tests passed** after fixture repair. Tests exercise real CARE JWT/permission
   records, role/phone scoping, shared family phones, invalid/expired/wrong token types, statuses,
@@ -372,6 +426,8 @@ it unchanged against the now-configured backend or treat that expected-status mi
    resolve the remaining patient appointment integration concern using existing supported
    extension points or overrides. Keep the underlying booking, link, authorization and clinical
    workflow unified.
+   Schedule-mode verification is recorded above. Rollout still requires explicit opt-in of
+   existing video schedules.
 4. Review/commit the existing fixes and documentation in their respective plugin repositories
    when ready. Repository destination/visibility for publication has not been supplied.
 5. Expand scope only when requested; recording/transcripts/SMS/jobs are not unfinished v1 work.

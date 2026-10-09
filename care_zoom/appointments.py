@@ -19,6 +19,12 @@ def configured():
     )
 
 
+def schedule_video_enabled(schedule):
+    meta = schedule.meta
+    config = meta.get("care_zoom") if isinstance(meta, dict) else None
+    return isinstance(config, dict) and config.get("video_enabled") is True
+
+
 def eligibility(booking, now=None):
     """One policy for both metadata and every token request; window is inclusive."""
     now = now or timezone.now()
@@ -31,6 +37,10 @@ def eligibility(booking, now=None):
         reason = "This appointment has no assigned practitioner."
     elif not resource.user.is_active:
         reason = "The assigned practitioner is inactive."
+    elif not slot.availability_id or not schedule_video_enabled(
+        slot.availability.schedule
+    ):
+        reason = "Video calls are not enabled for this appointment's schedule."
     elif booking.status not in ALLOWED_STATUSES:
         reason = "Video calls are unavailable for this appointment status."
     elif slot.end_datetime <= slot.start_datetime:

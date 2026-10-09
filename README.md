@@ -2,7 +2,8 @@
 
 Current implementation, setup and remaining work: [implementation handoff](./IMPLEMENTATION.md).
 
-Stateless Zoom Video SDK calls for CARE practitioner appointments. Requires CARE revision
+Zoom Video SDK calls for CARE practitioner appointments on video-enabled schedules, without
+persisted call sessions. Requires CARE revision
 `3fe704930d9b2d7b6ffdc212cbf6a6a72bfaede4` and the companion `care_zoom_fe` frontend.
 
 The assigned active practitioner may join as host; an existing CARE patient OTP session may join
@@ -12,7 +13,27 @@ only the assigned practitioner may obtain a host token. Both checks run on every
 
 No models, migrations, signals, scheduled jobs, appointment writes, recording, transcripts,
 webhooks, reminders or link-delivery messages are added. Joining and leaving never changes
-appointment status. An encounter and slot availability are not required.
+appointment status. An encounter is not required; the booking's slot must belong to an
+availability under a video-enabled schedule.
+
+## Schedule consultation mode
+
+In Schedule Management, use **Consultation mode** beside the native **Edit** action to choose
+**In person** or **Video call** for the whole practitioner schedule. The default is in person.
+The plugin stores only `Schedule.meta["care_zoom"]["video_enabled"]`; only the boolean `true`
+enables video. Missing flags leave existing and newly created schedules in person. Use separate
+schedules for different modes; there are no per-time-block overrides or booking snapshots.
+
+The setting applies immediately to all existing and future bookings under that schedule.
+For eligible video appointments, the assigned practitioner sees **Join Video Call** beside the
+native Check-In/action group; staff with booking-read access may copy the link. In-person
+appointments have no Zoom actions, and both staff and patient direct token requests are denied.
+Changing to in person does not revoke already issued Zoom tokens or disconnect running calls.
+
+This is plugin code plus external runtime registration, with **zero tracked core changes**.
+The flag is consultation configuration, not a meeting ID or credential. It uses the existing
+core metadata field and schedule permissions, without migrations or signals. Existing video
+schedules must be explicitly enabled during rollout; no bulk opt-in runs automatically.
 
 ## Configuration
 
@@ -51,19 +72,28 @@ Compose override. Recreate services after changing environment configuration:
 ## API
 
 All routes are beneath `/api/care_zoom/`; requests carry `Authorization: Bearer <CARE token>`.
-Use staff access tokens for the first two and CARE patient-login tokens for the OTP variants.
+Use staff access tokens for schedule and staff appointment routes, and CARE patient-login
+tokens for the OTP variants.
 
 | Method | Path | Access |
 | --- | --- | --- |
+| GET | `facility/<facility_uuid>/schedules/<schedule_uuid>/video/` | Core `can_list_schedule(resource, user)` permission |
+| PATCH | `facility/<facility_uuid>/schedules/<schedule_uuid>/video/` | Core `can_write_schedule(resource, user)` permission |
 | GET | `appointments/<uuid>/` | Core `can_list_booking(resource, user)` permission |
 | POST | `appointments/<uuid>/token/` | Same permission plus assigned practitioner |
 | GET | `otp/appointments/<uuid>/` | Core `JWTTokenPatientAuthentication`, `OTPAuthenticatedPermission`, matching patient phone |
 | POST | `otp/appointments/<uuid>/token/` | Same phone ownership and current eligibility |
 
-GET returns `booking_id`, `status`, `patient_name`, `practitioner_name`, `start_datetime`,
+The schedule routes return `{ "schedule_id": "<uuid>", "video_enabled": false }`. PATCH accepts
+`{ "video_enabled": true }` or `{ "video_enabled": false }`, requires a JSON boolean, and
+preserves other metadata.
+The facility must match the schedule's active practitioner resource. This endpoint uses staff
+authentication only; patient OTP tokens cannot read or change consultation mode.
+
+Appointment GET returns `booking_id`, `status`, `patient_name`, `practitioner_name`, `start_datetime`,
 `end_datetime`, `join_opens_at`, `join_closes_at`, `join_path`, `eligible`, `can_join`,
 `caller_role` (`host`, `participant`, `observer`), `reason` and `configured`.
-`eligible` describes resource/status eligibility independently of the clock, caller role and
+`eligible` describes schedule/resource/status eligibility independently of the clock, caller role and
 configuration. `can_join` includes those checks. The path is `/teleconsult/<booking_uuid>`;
 the frontend resolves it against its own origin, so links never contain credentials.
 
@@ -72,8 +102,9 @@ It returns `token`, `session_name`, `session_key`, `display_name`, `role` (`host
 `participant`) and `expires_at`. Keep this response only in browser memory. All view responses,
 including errors, use `Cache-Control: no-store`.
 
-Bookings are eligible only with a practitioner resource and an active assigned user, a valid
-slot interval and status `booked`, `arrived`, `checked_in` or `in_consultation`. Issuance opens
+Bookings are eligible only with a practitioner resource and an active assigned user, an
+availability under a video-enabled schedule, a valid slot interval and status `booked`,
+`arrived`, `checked_in` or `in_consultation`. Issuance opens
 15 minutes before slot start and closes 60 minutes after slot end, including both exact boundary
 instants. Soft-deleted booking, patient, slot, resource, facility, assigned user and any present
 availability/schedule are rejected with 404. Non-practitioner resources also return 404. Unrelated patient phones also receive 404.
@@ -86,8 +117,8 @@ Zoom's minimum 1,800-second interval. See the [official authorization contract](
 
 A reschedule creates a new booking and link; the old booking's `rescheduled` status prevents
 new tokens. Reassignment prevents the former practitioner obtaining another host token. Changes
-to state, phone ownership or assignment **do not revoke already issued tokens** or disconnect a
-running call. Host End for everyone ends the current session; a subsequently authorized caller
+to schedule mode, state, phone ownership or assignment **do not revoke already issued tokens**
+or disconnect a running call. Host End for everyone ends the current session; a subsequently authorized caller
 can start another session while the booking remains eligible.
 
 ## Verification
@@ -95,8 +126,11 @@ can start another session while the booking remains eligible.
 The suite uses real CARE access/patient JWTs and permission records, with test-only Zoom
 credentials. It covers authorized roles, unrelated phones and staff, shared family phone,
 expired/invalid/wrong token types, all appointment statuses, exact issuance boundaries,
-soft-deleted scheduling relationships, missing/inactive practitioner, no encounter/availability,
-reassignment, rescheduled links, server-derived claims, signing and no appointment mutation.
+soft-deleted scheduling relationships, missing/inactive practitioner, absent encounter,
+rejected missing availability and in-person schedules, reassignment, rescheduled links,
+server-derived claims, signing and no appointment mutation. Schedule tests cover separate
+read/write permissions, strict booleans, facility scoping and preservation of other metadata.
+The explicit DEBUG-only local seed opts in only its synthetic Zoom fixture schedule.
 
 Run against this scaffold's isolated services (never another workspace):
 

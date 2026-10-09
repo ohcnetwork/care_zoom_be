@@ -5,9 +5,15 @@ from care_zoom.views import (
     AppointmentView,
     OTPAppointmentTokenView,
     OTPAppointmentView,
+    ScheduleVideoView,
 )
 
 urlpatterns = [
+    path(
+        "facility/<uuid:facility_id>/schedules/<uuid:schedule_id>/video/",
+        ScheduleVideoView.as_view(),
+        name="zoom-schedule-video",
+    ),
     path(
         "appointments/<uuid:booking_id>/",
         AppointmentView.as_view(),
