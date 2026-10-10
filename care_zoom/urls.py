@@ -3,6 +3,8 @@ from django.urls import path
 from care_zoom.views import (
     AppointmentTokenView,
     AppointmentView,
+    GuestAppointmentTokenView,
+    GuestAppointmentView,
     OTPAppointmentTokenView,
     OTPAppointmentView,
     ScheduleVideoView,
@@ -33,5 +35,15 @@ urlpatterns = [
         "otp/appointments/<uuid:booking_id>/token/",
         OTPAppointmentTokenView.as_view(),
         name="zoom-otp-token",
+    ),
+    path(
+        "guest/appointments/<uuid:booking_id>/",
+        GuestAppointmentView.as_view(),
+        name="zoom-guest-appointment",
+    ),
+    path(
+        "guest/appointments/<uuid:booking_id>/token/",
+        GuestAppointmentTokenView.as_view(),
+        name="zoom-guest-token",
     ),
 ]

@@ -5,6 +5,7 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -103,6 +104,8 @@ class ScheduleVideoView(ZoomBaseView):
 
 class AppointmentBaseView(ZoomBaseView):
     patient = False
+    # Guest joins skip the phone-match check below; the booking link is the only secret.
+    guest = False
 
     def get_booking(self, request, booking_id):
         # Related default managers do not filter soft-deleted rows in JOINs.
@@ -135,7 +138,7 @@ class AppointmentBaseView(ZoomBaseView):
                 "token_slot__availability__schedule__resource",
             )
         )
-        if self.patient:
+        if self.patient and not self.guest:
             bookings = bookings.filter(patient__phone_number=request.user.phone_number)
         booking = get_object_or_404(bookings, external_id=booking_id)
         if not self.patient:
@@ -224,3 +227,47 @@ class OTPAppointmentTokenView(AppointmentTokenView):
     patient = True
     authentication_classes = [JWTTokenPatientAuthentication]
     permission_classes = [OTPAuthenticatedPermission]
+
+
+class GuestAppointmentView(AppointmentView):
+    """Metadata for anyone holding the booking link; no identity is verified."""
+
+    patient = True
+    guest = True
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+
+class GuestAppointmentTokenView(AppointmentTokenView):
+    """Issues a participant token to anyone who names themselves and gives consent.
+
+    There is no proof the caller is the actual patient; the booking link is the
+    only secret protecting this appointment.
+    """
+
+    patient = True
+    guest = True
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request, booking_id):
+        data = request.data if isinstance(request.data, dict) else {}
+        name = str(data.get("display_name") or "").strip()
+        if not name:
+            raise ValidationError({"display_name": "This field is required."})
+        if data.get("consent") is not True:
+            raise ValidationError({"consent": "Consent is required to join."})
+        booking = self.get_booking(request, booking_id)
+        if self.caller_role(request, booking) == "observer":
+            raise PermissionDenied(
+                "Only the assigned practitioner can join this video appointment."
+            )
+        now = timezone.now()
+        _, reason, _, _ = eligibility(booking, now)
+        if reason:
+            raise ValidationError({"detail": reason})
+        if not configured():
+            raise ZoomUnavailable()
+        return Response(
+            mint_token(booking, patient=True, now=now, guest_name=name[:200])
+        )

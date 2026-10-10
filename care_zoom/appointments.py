@@ -53,7 +53,7 @@ def eligibility(booking, now=None):
     return eligible, reason, opens, closes
 
 
-def mint_token(booking, *, patient, now=None):
+def mint_token(booking, *, patient, now=None, guest_name=None):
     now = now or timezone.now()
     person = booking.patient if patient else booking.token_slot.resource.user
     role = "participant" if patient else "host"
@@ -74,7 +74,11 @@ def mint_token(booking, *, patient, now=None):
     }
     if plugin_settings.ZOOM_GEO_REGIONS:
         claims["geo_regions"] = plugin_settings.ZOOM_GEO_REGIONS
-    display_name = person.name if patient else person.get_full_name() or person.username
+    display_name = (
+        (guest_name or person.name)
+        if patient
+        else person.get_full_name() or person.username
+    )
     return {
         "token": jwt.encode(
             claims, plugin_settings.ZOOM_VIDEO_SDK_SECRET, algorithm="HS256"
