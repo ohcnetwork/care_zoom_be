@@ -26,8 +26,7 @@ def schedule_video_enabled(schedule):
 
 
 def eligibility(booking, now=None):
-    """One policy for both metadata and every token request; window is inclusive."""
-    now = now or timezone.now()
+    """One policy for both metadata and every token request; join window is unrestricted."""
     slot = booking.token_slot
     resource = slot.resource
     opens = slot.start_datetime - timedelta(minutes=15)
@@ -46,10 +45,6 @@ def eligibility(booking, now=None):
     elif slot.end_datetime <= slot.start_datetime:
         reason = "This appointment has an invalid time range."
     eligible = reason is None
-    if eligible and now < opens:
-        reason = "This video appointment has not opened yet."
-    elif eligible and now > closes:
-        reason = "This video appointment has closed."
     return eligible, reason, opens, closes
 
 
