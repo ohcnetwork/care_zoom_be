@@ -1,6 +1,6 @@
 # CARE Zoom v1 — implementation handoff
 
-Last updated: 8 October 2026. This is the starting point for continuing the Zoom plugin in a new
+Last updated: 11 October 2026. This is the starting point for continuing the Zoom plugin in a new
 session. Read the workspace `AGENTS.md`, then `skills/care-plugin-architecture/SKILL.md`, before
 editing. The verified v1 baseline works with the core revisions below; newer working-tree
 additions are identified separately. Live two-party audio/video and mobile acceptance remain open.
@@ -82,10 +82,41 @@ controls, participant presence, reconnect feedback, Leave and host End for every
 selection is capability-dependent; mobile camera choices use facing modes. Media/listeners/SDK
 client are disposed on leave, unmount, logout and identity change.
 
-No plugin models, schema migrations, signals, background jobs, appointment writes, recordings,
+No plugin models, schema migrations, background jobs, appointment status writes, recordings,
 transcripts, Scribe integration, consent persistence, reminders, link-delivery SMS, chat, screen
 sharing, waiting room or native apps were added. Existing CARE patient OTP authentication still
-uses core's OTP/SMS mechanism; “without SMS” applied to plugin link/reminder messaging.
+uses core's OTP/SMS mechanism; passcode links now also support guest access as described below.
+
+### Guest access (11 October 2026)
+
+- `signals.py`, registered from `AppConfig.ready()`, uses `pre_save` on new eligible video
+  bookings to store `meta.care_zoom.meeting_passcode` in the original insert. Passcodes use
+  `secrets.token_urlsafe(32)`. Existing bookings receive one on authorized staff/OTP metadata
+  reads, under a row lock that preserves other metadata. No migrations or bulk backfill.
+- Eligible staff/OTP `join_path` values now include `?passcode=...`. Staff Copy Link and patient
+  portal links use that returned path. The same CallPage/PublicRouter handles guests; no new
+  page or UI input. Signed-in staff keep the existing host authorization and facility redirect.
+- `/api/care_zoom/guest/appointments/<uuid>/` and its `/token/` variant accept the passcode in
+  `Authorization: Bearer ...`, with constant-time comparison before exposing metadata. No CARE
+  token is sent on guest requests. Guest metadata omits `staff_context` and does not echo the
+  passcode; SDK tokens remain participant-only. All existing eligibility/window checks apply.
+- The link is a bearer credential, not verified identity. It gives access to the appointment's
+  displayed names/time and its participant call, never clinical records or host privileges.
+  Keep it private, use HTTPS, and redact the query parameter from hosting/analytics logs.
+  Referrers are suppressed by the call page and plugin API client, but initial navigation and
+  browser history still contain the query. No rotation UI is included.
+- Links without passcodes keep OTP compatibility. Passcode or booking changes unmount an active
+  guest call. Existing SDK tokens/calls are not revoked by cancellation or a changed passcode;
+  subsequent issuance rechecks the current booking and credential.
+- See the backend README's Guest links section for the current contract. Older verification
+  and "no signal/appointment writes" statements below describe the previous baseline.
+- Verification on 11 October: 40 backend tests, 64 frontend tests, seven existing mocked-API
+  host browser tests, production build and migration check passed. Real HTTP checked a temporary
+  synthetic booking's staff link, guest metadata/token, missing passcode and cancellation, then
+  deleted only those test rows. In the real host, Copy Link succeeded; after logout the fixture's
+  passcode opened this same page, and an invalid passcode exposed no appointment details. That
+  fixture was past its join window, correctly showing a closed appointment. Real guest Zoom
+  media/two-party calling was not exercised. Both tracked core trees and revisions are unchanged.
 
 **Open UX followup:** staff Join/Copy actions are inside native appointment details, but the
 patient portal currently adds a separate **Video appointments** panel above the existing portal.
@@ -147,7 +178,7 @@ do not create a separate consultation model or change the plugin's appointment-w
 
 Source: `care_zoom/appointments.py` owns shared eligibility/JWT construction;
 `care_zoom/views.py` owns record filtering and access; `care_zoom/urls.py` exposes the routes.
-All are beneath `/api/care_zoom/`, with `Authorization: Bearer <CARE token>`:
+All are beneath `/api/care_zoom/`, with `Authorization: Bearer <CARE token>` except guest routes:
 
 | Method / route | Required access |
 | --- | --- |
@@ -157,6 +188,8 @@ All are beneath `/api/care_zoom/`, with `Authorization: Bearer <CARE token>`:
 | `POST appointments/<uuid>/token/` | Same, plus staff is the assigned active practitioner |
 | `GET otp/appointments/<uuid>/` | Core `JWTTokenPatientAuthentication` and `OTPAuthenticatedPermission`, matching appointment patient phone |
 | `POST otp/appointments/<uuid>/token/` | Same phone ownership plus current eligibility |
+| `GET guest/appointments/<uuid>/` | Meeting passcode bearer; no CARE login |
+| `POST guest/appointments/<uuid>/token/` | Same passcode and eligibility; participant only |
 
 Staff with booking-read permission may copy a link but cannot join unless assigned. Family
 patient records sharing the OTP-authenticated phone follow core's existing shared-phone access
@@ -172,8 +205,12 @@ older or malformed metadata.
 - Eligible statuses: `booked`, `arrived`, `checked_in`, `in_consultation`.
 - Required resource: practitioner, active assigned user, valid positive slot interval and
   availability under an explicitly video-enabled schedule.
-- Token issuance window: **15 minutes before slot start through 60 minutes after slot end**,
-  including both exact boundary instants.
+- Token issuance window: **midnight on the slot's start date in CARE's timezone through
+  60 minutes after slot end**, including both exact boundary instants. The opening time was
+  changed on 11 October for staff, OTP patients and passcode guests; this workspace uses
+  `Asia/Kolkata`. `join_opens_at` remains a timestamp, with no frontend or schema change.
+  All 40 backend tests passed after this change, including exact local-midnight/end boundaries.
+  Real HTTP also confirmed a temporary same-day appointment could join 30 minutes early.
 - Soft-deleted booking, patient, slot, resource, facility, assigned user, and any present
   availability/schedule relationship are rejected. Missing availability makes video ineligible.
 - Missing/non-practitioner/deleted records and another patient phone return 404; unauthorized

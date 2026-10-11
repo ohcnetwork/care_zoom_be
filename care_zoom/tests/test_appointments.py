@@ -1,7 +1,8 @@
 """Run with CARE's isolated PostgreSQL test database, never a production database."""
 
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import jwt
@@ -18,6 +19,7 @@ from care.emr.models.scheduling.schedule import (
 )
 from care.security.permissions.schedule import SchedulePermissions
 from care.utils.tests.base import CareAPITestBase
+from care_zoom.appointments import ensure_meeting_passcode, meeting_passcode
 from config.patient_otp_token import PatientToken
 
 TEST_KEY = "test-video-sdk-key"
@@ -94,8 +96,22 @@ class AppointmentTests(CareAPITestBase):
             )
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
 
-    def url(self, *, otp=False, token=False, booking=None):
-        name = "zoom-" + ("otp-" if otp else "") + ("token" if token else "appointment")
+    def guest(self):
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {meeting_passcode(self.booking)}"
+        )
+
+    def authenticate(self, *, otp=False, guest=False):
+        if guest:
+            self.guest()
+        elif otp:
+            self.otp()
+        else:
+            self.staff(self.doctor)
+
+    def url(self, *, otp=False, guest=False, token=False, booking=None):
+        prefix = "guest-" if guest else "otp-" if otp else ""
+        name = "zoom-" + prefix + ("token" if token else "appointment")
         return reverse(
             name, kwargs={"booking_id": (booking or self.booking).external_id}
         )
@@ -119,7 +135,8 @@ class AppointmentTests(CareAPITestBase):
         self.assertTrue(info.data["can_join"])
         self.assertEqual(info.data["caller_role"], "host")
         self.assertEqual(
-            info.data["join_path"], f"/teleconsult/{self.booking.external_id}"
+            info.data["join_path"],
+            f"/teleconsult/{self.booking.external_id}?passcode={meeting_passcode(self.booking)}",
         )
         self.assertNotIn("token", info.data)
         host = self.client.post(
@@ -268,37 +285,53 @@ class AppointmentTests(CareAPITestBase):
         for status in sorted(allowed | denied):
             self.booking.status = status
             self.booking.save(update_fields=["status"])
-            for otp in (False, True):
-                with self.subTest(status=status, otp=otp):
-                    self.otp() if otp else self.staff(self.doctor)
-                    metadata = self.client.get(self.url(otp=otp))
+            for otp, guest in ((False, False), (True, False), (False, True)):
+                with self.subTest(status=status, otp=otp, guest=guest):
+                    self.authenticate(otp=otp, guest=guest)
+                    metadata = self.client.get(self.url(otp=otp, guest=guest))
                     self.assertEqual(metadata.status_code, 200)
                     self.assertEqual(metadata.data["eligible"], status in allowed)
-                    response = self.client.post(self.url(otp=otp, token=True))
+                    response = self.client.post(
+                        self.url(otp=otp, guest=guest, token=True)
+                    )
                     self.assertEqual(
                         response.status_code, 200 if status in allowed else 400
                     )
 
-    def test_exact_inclusive_issuance_boundaries(self):
-        opens = self.slot.start_datetime - timedelta(minutes=15)
-        closes = self.slot.end_datetime + timedelta(minutes=60)
-        for now, allowed in (
-            (opens - timedelta(microseconds=1), False),
-            (opens, True),
-            (closes, True),
-            (closes + timedelta(microseconds=1), False),
-        ):
-            for otp in (False, True):
-                with (
-                    self.subTest(now=now, otp=otp),
-                    patch("care_zoom.appointments.timezone.now", return_value=now),
-                ):
-                    self.otp() if otp else self.staff(self.doctor)
-                    metadata = self.client.get(self.url(otp=otp))
-                    self.assertTrue(metadata.data["eligible"])
-                    self.assertEqual(metadata.data["can_join"], allowed)
-                    response = self.client.post(self.url(otp=otp, token=True))
-                    self.assertEqual(response.status_code, 200 if allowed else 400)
+    @timezone.override("Asia/Kolkata")
+    def test_local_midnight_opening_and_inclusive_end_grace(self):
+        opens = datetime.combine(
+            timezone.localdate(self.now), time.min, timezone.get_current_timezone()
+        )
+        # An early local slot is stored on the previous UTC date.
+        for offset in (timedelta(minutes=10), timedelta(hours=16)):
+            self.slot.start_datetime = opens + offset
+            self.slot.end_datetime = self.slot.start_datetime + timedelta(minutes=30)
+            self.slot.save(update_fields=["start_datetime", "end_datetime"])
+            closes = self.slot.end_datetime + timedelta(minutes=60)
+            for now, allowed in (
+                (opens - timedelta(microseconds=1), False),
+                (opens, True),
+                (opens + timedelta(minutes=1), True),
+                (closes, True),
+                (closes + timedelta(microseconds=1), False),
+            ):
+                for otp, guest in ((False, False), (True, False), (False, True)):
+                    with (
+                        self.subTest(offset=offset, now=now, otp=otp, guest=guest),
+                        patch("care_zoom.appointments.timezone.now", return_value=now),
+                    ):
+                        self.authenticate(otp=otp, guest=guest)
+                        metadata = self.client.get(self.url(otp=otp, guest=guest))
+                        self.assertEqual(metadata.status_code, 200)
+                        self.assertEqual(metadata.data["join_opens_at"], opens)
+                        self.assertEqual(metadata.data["join_closes_at"], closes)
+                        self.assertTrue(metadata.data["eligible"])
+                        self.assertEqual(metadata.data["can_join"], allowed)
+                        response = self.client.post(
+                            self.url(otp=otp, guest=guest, token=True)
+                        )
+                        self.assertEqual(response.status_code, 200 if allowed else 400)
 
     def test_deleted_scheduling_records_are_never_returned(self):
         for obj in (
@@ -326,6 +359,13 @@ class AppointmentTests(CareAPITestBase):
                 self.assert_denied_without_token(
                     self.client.post(self.url(otp=True, token=True)), 404
                 )
+                self.guest()
+                self.assert_denied_without_token(
+                    self.client.get(self.url(guest=True)), 404
+                )
+                self.assert_denied_without_token(
+                    self.client.post(self.url(guest=True, token=True)), 404
+                )
                 obj.deleted = False
                 obj.save(update_fields=["deleted"])
 
@@ -352,14 +392,15 @@ class AppointmentTests(CareAPITestBase):
         ):
             self.schedule.meta = meta
             self.schedule.save(update_fields=["meta"])
-            for otp in (False, True):
-                with self.subTest(meta=meta, otp=otp):
-                    self.otp() if otp else self.staff(self.doctor)
-                    response = self.client.get(self.url(otp=otp))
+            for otp, guest in ((False, False), (True, False), (False, True)):
+                with self.subTest(meta=meta, otp=otp, guest=guest):
+                    self.authenticate(otp=otp, guest=guest)
+                    response = self.client.get(self.url(otp=otp, guest=guest))
                     self.assertFalse(response.data["eligible"])
                     self.assertFalse(response.data["can_join"])
                     self.assert_denied_without_token(
-                        self.client.post(self.url(otp=otp, token=True)), 400
+                        self.client.post(self.url(otp=otp, guest=guest, token=True)),
+                        400,
                     )
 
     def test_missing_or_inactive_practitioner_cannot_issue_tokens(self):
@@ -485,3 +526,132 @@ class AppointmentTests(CareAPITestBase):
     def test_info_endpoint_cannot_mint_and_token_endpoint_cannot_get(self):
         self.assertEqual(self.client.post(self.url()).status_code, 405)
         self.assertEqual(self.client.get(self.url(token=True)).status_code, 405)
+
+    def test_creation_passcode_is_unique_stable_and_preserves_metadata(self):
+        passcode = meeting_passcode(self.booking)
+        self.assertRegex(passcode, r"^[A-Za-z0-9_-]{43}$")
+        replacement = TokenBooking.objects.create(
+            token_slot=self.slot,
+            patient=self.patient,
+            status="booked",
+            meta={"other_plugin": {"value": 1}, "care_zoom": {"other": True}},
+        )
+        replacement.refresh_from_db()
+        self.assertNotEqual(meeting_passcode(replacement), passcode)
+        self.assertEqual(replacement.meta["other_plugin"], {"value": 1})
+        self.assertTrue(replacement.meta["care_zoom"]["other"])
+        self.booking.status = "arrived"
+        self.booking.save()
+        self.booking.refresh_from_db()
+        self.assertEqual(meeting_passcode(self.booking), passcode)
+
+    def test_old_booking_gets_one_passcode_only_after_authorized_read(self):
+        original = {"other_plugin": {"value": 1}, "care_zoom": {"other": True}}
+        TokenBooking.objects.filter(pk=self.booking.pk).update(meta=original)
+        self.booking.refresh_from_db()
+        stale = TokenBooking.objects.get(pk=self.booking.pk)
+        self.client.credentials()
+        self.assert_denied_without_token(self.client.get(self.url(guest=True)), 404)
+        self.otp("+918888888888")
+        self.assert_denied_without_token(self.client.get(self.url(otp=True)), 404)
+        self.booking.refresh_from_db()
+        self.assertEqual(self.booking.meta, original)
+        self.staff(self.other)
+        info = self.client.get(self.url())
+        self.assertEqual(info.status_code, 200)
+        self.booking.refresh_from_db()
+        passcode = meeting_passcode(self.booking)
+        self.assertEqual(ensure_meeting_passcode(stale), passcode)
+        self.assertEqual(self.booking.meta["other_plugin"], original["other_plugin"])
+        self.assertTrue(self.booking.meta["care_zoom"]["other"])
+        self.otp()
+        self.assertEqual(
+            self.client.get(self.url(otp=True)).data["join_path"],
+            info.data["join_path"],
+        )
+        self.assertEqual(
+            parse_qs(urlsplit(info.data["join_path"]).query), {"passcode": [passcode]}
+        )
+
+    def test_schedule_enabled_after_creation_gets_passcode_on_read(self):
+        self.schedule.meta = {}
+        self.schedule.save(update_fields=["meta"])
+        booking = TokenBooking.objects.create(
+            token_slot=self.slot, patient=self.patient, status="booked"
+        )
+        self.assertFalse(meeting_passcode(booking))
+        self.client.get(self.url(booking=booking))
+        booking.refresh_from_db()
+        self.assertFalse(meeting_passcode(booking))
+        self.schedule.meta = {"care_zoom": {"video_enabled": True}}
+        self.schedule.save(update_fields=["meta"])
+        self.client.get(self.url(booking=booking))
+        booking.refresh_from_db()
+        self.assertRegex(meeting_passcode(booking), r"^[A-Za-z0-9_-]{43}$")
+
+    def test_guest_link_grants_only_appointment_metadata_and_participant_token(self):
+        self.guest()
+        info = self.client.get(self.url(guest=True))
+        self.assertEqual(info.status_code, 200)
+        self.assertEqual(info.data["caller_role"], "participant")
+        self.assertTrue(info.data["can_join"])
+        self.assertNotIn("staff_context", info.data)
+        self.assertNotIn(meeting_passcode(self.booking), str(info.data))
+        before = TokenBooking.objects.filter(pk=self.booking.pk).values().get()
+        token = self.client.post(
+            self.url(guest=True, token=True),
+            {"role_type": 1, "session_name": "attacker", "patient": str(uuid4())},
+        )
+        claims = self.claims(token)
+        self.assertEqual(claims["role_type"], 0)
+        self.assertEqual(claims["tpc"], f"care-{self.booking.external_id}")
+        self.assertEqual(token.data["role"], "participant")
+        self.assertEqual(
+            TokenBooking.objects.filter(pk=self.booking.pk).values().get(), before
+        )
+        self.assert_denied_without_token(self.client.post(self.url(token=True)), 403)
+        self.assert_denied_without_token(
+            self.client.post(self.url(otp=True, token=True)), 401
+        )
+
+    def test_guest_rejects_missing_wrong_cross_booking_and_care_credentials(self):
+        other = TokenBooking.objects.create(
+            token_slot=self.slot, patient=self.patient, status="booked"
+        )
+        for header in (
+            "",
+            "Bearer wrong",
+            "Bearer é",
+            f"Bearer {meeting_passcode(other)}",
+            f"Bearer {AccessToken.for_user(self.doctor)}",
+        ):
+            with self.subTest(header_type="invalid"):
+                self.client.credentials(HTTP_AUTHORIZATION=header)
+                self.assert_denied_without_token(
+                    self.client.get(self.url(guest=True)), 404
+                )
+                self.assert_denied_without_token(
+                    self.client.post(self.url(guest=True, token=True)), 404
+                )
+        self.client.credentials()
+        self.assert_denied_without_token(
+            self.client.get(
+                self.url(guest=True), {"passcode": meeting_passcode(self.booking)}
+            ),
+            404,
+        )
+
+    def test_guest_does_not_accept_empty_or_malformed_stored_passcodes(self):
+        for meta in (
+            {},
+            [],
+            {"care_zoom": True},
+            {"care_zoom": {"meeting_passcode": ""}},
+            {"care_zoom": {"meeting_passcode": 123}},
+        ):
+            TokenBooking.objects.filter(pk=self.booking.pk).update(meta=meta)
+            self.client.credentials(HTTP_AUTHORIZATION="Bearer ")
+            self.assert_denied_without_token(self.client.get(self.url(guest=True)), 404)
+            self.assert_denied_without_token(
+                self.client.post(self.url(guest=True, token=True)), 404
+            )

@@ -1,10 +1,17 @@
-"""Schedule video settings and appointment authorization; no booking state writes."""
+"""Schedule settings and call authorization; booking status is unchanged."""
 
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+from django.utils.crypto import constant_time_compare
+from rest_framework.exceptions import (
+    APIException,
+    NotFound,
+    PermissionDenied,
+    ValidationError,
+)
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -15,6 +22,8 @@ from care.utils.lock import Lock
 from care_zoom.appointments import (
     configured,
     eligibility,
+    ensure_meeting_passcode,
+    meeting_passcode,
     mint_token,
     schedule_video_enabled,
 )
@@ -103,6 +112,7 @@ class ScheduleVideoView(ZoomBaseView):
 
 class AppointmentBaseView(ZoomBaseView):
     patient = False
+    guest = False
 
     def get_booking(self, request, booking_id):
         # Related default managers do not filter soft-deleted rows in JOINs.
@@ -135,9 +145,15 @@ class AppointmentBaseView(ZoomBaseView):
                 "token_slot__availability__schedule__resource",
             )
         )
-        if self.patient:
+        if self.patient and not self.guest:
             bookings = bookings.filter(patient__phone_number=request.user.phone_number)
         booking = get_object_or_404(bookings, external_id=booking_id)
+        if self.guest:
+            passcode = meeting_passcode(booking)
+            if not passcode or not constant_time_compare(
+                request.headers.get("Authorization", ""), f"Bearer {passcode}"
+            ):
+                raise NotFound()
         if not self.patient:
             if request.user.deleted or not request.user.is_active:
                 raise PermissionDenied("Your staff account is inactive.")
@@ -170,6 +186,9 @@ class AppointmentView(AppointmentBaseView):
             reason = ZoomUnavailable.default_detail
         slot = booking.token_slot
         doctor = slot.resource.user
+        join_path = f"/teleconsult/{booking.external_id}"
+        if eligible and not self.guest:
+            join_path += f"?passcode={ensure_meeting_passcode(booking)}"
         response = Response(
             {
                 "booking_id": booking.external_id,
@@ -182,7 +201,7 @@ class AppointmentView(AppointmentBaseView):
                 "end_datetime": slot.end_datetime,
                 "join_opens_at": opens,
                 "join_closes_at": closes,
-                "join_path": f"/teleconsult/{booking.external_id}",
+                "join_path": join_path,
                 "eligible": eligible,
                 "can_join": reason is None,
                 "caller_role": role,
@@ -224,3 +243,17 @@ class OTPAppointmentTokenView(AppointmentTokenView):
     patient = True
     authentication_classes = [JWTTokenPatientAuthentication]
     permission_classes = [OTPAuthenticatedPermission]
+
+
+class GuestAppointmentView(AppointmentView):
+    patient = True
+    guest = True
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+
+class GuestAppointmentTokenView(AppointmentTokenView):
+    patient = True
+    guest = True
+    authentication_classes = []
+    permission_classes = [AllowAny]

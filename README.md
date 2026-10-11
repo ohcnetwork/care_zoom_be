@@ -6,15 +6,41 @@ Zoom Video SDK calls for CARE practitioner appointments on video-enabled schedul
 persisted call sessions. Requires CARE revision
 `3fe704930d9b2d7b6ffdc212cbf6a6a72bfaede4` and the companion `care_zoom_fe` frontend.
 
-The assigned active practitioner may join as host; an existing CARE patient OTP session may join
-for a patient with the authenticated phone number. Family records follow CARE's existing shared
+The assigned active practitioner may join as host; a meeting-passcode link or an existing CARE
+patient OTP session may join as participant. OTP access requires the patient's authenticated phone number. Family records follow CARE's existing shared
 phone access model. Staff with booking-read permission may view/copy the appointment link, but
 only the assigned practitioner may obtain a host token. Both checks run on every token request.
 
-No models, migrations, signals, scheduled jobs, appointment writes, recording, transcripts,
+No models, migrations, scheduled jobs, recording, transcripts,
 webhooks, reminders or link-delivery messages are added. Joining and leaving never changes
 appointment status. An encounter is not required; the booking's slot must belong to an
 availability under a video-enabled schedule.
+
+## Guest links
+
+Copy Link and the patient portal use `/teleconsult/<booking_uuid>?passcode=<random-secret>`.
+The existing call page accepts this link without CARE login. Signed-in staff continue to use
+CARE permissions and the facility host route. Links without a passcode retain the OTP flow.
+
+A plugin `pre_save` signal writes a random 256-bit URL-safe passcode to
+`TokenBooking.meta["care_zoom"]["meeting_passcode"]` when an eligible video appointment is
+created, as part of the original insert. Existing appointments (including schedules switched to
+video later) receive a passcode on the first authorized staff/OTP metadata read. This fallback
+locks the booking while preserving other metadata; no migration or bulk backfill is needed.
+Ordinary booking updates keep the passcode. Rescheduling creates a new booking and passcode.
+
+The passcode is a bearer credential for this appointment's call metadata and participant token;
+it does not prove the caller's identity or grant patient-record, staff, or host access. Anyone
+with the link can use it. Guest token requests apply the same schedule, status, related-record,
+configuration and time-window checks as authenticated requests. Cancellation prevents new
+tokens; already issued Zoom tokens and active sessions are unaffected.
+
+Guest API requests use `Authorization: Bearer <meeting_passcode>` rather than a query parameter.
+The call page and API fetches suppress referrers. Deploy with HTTPS and redact `passcode` from
+frontend access/analytics logs: the initial page URL and browser history still contain it. Store
+and share links as credentials. The passcode is kept in metadata so authorized users can recopy
+the same link; it is separate from the short-lived Zoom SDK token. No manual passcode input,
+rotation UI, or new page is added.
 
 ## Schedule consultation mode
 
@@ -71,7 +97,7 @@ Compose override. Recreate services after changing environment configuration:
 
 ## API
 
-All routes are beneath `/api/care_zoom/`; requests carry `Authorization: Bearer <CARE token>`.
+All routes are beneath `/api/care_zoom/`; authenticated requests carry `Authorization: Bearer <CARE token>`.
 Use staff access tokens for schedule and staff appointment routes, and CARE patient-login
 tokens for the OTP variants.
 
@@ -83,6 +109,8 @@ tokens for the OTP variants.
 | POST | `appointments/<uuid>/token/` | Same permission plus assigned practitioner |
 | GET | `otp/appointments/<uuid>/` | Core `JWTTokenPatientAuthentication`, `OTPAuthenticatedPermission`, matching patient phone |
 | POST | `otp/appointments/<uuid>/token/` | Same phone ownership and current eligibility |
+| GET | `guest/appointments/<uuid>/` | Matching meeting passcode in the bearer header; no CARE login |
+| POST | `guest/appointments/<uuid>/token/` | Same passcode plus current eligibility; participant only |
 
 The schedule routes return `{ "schedule_id": "<uuid>", "video_enabled": false }`. PATCH accepts
 `{ "video_enabled": true }` or `{ "video_enabled": false }`, requires a JSON boolean, and
@@ -94,8 +122,8 @@ Appointment GET returns `booking_id`, `status`, `patient_name`, `practitioner_na
 `end_datetime`, `join_opens_at`, `join_closes_at`, `join_path`, `eligible`, `can_join`,
 `caller_role` (`host`, `participant`, `observer`), `reason` and `configured`.
 `eligible` describes schedule/resource/status eligibility independently of the clock, caller role and
-configuration. `can_join` includes those checks. The path is `/teleconsult/<booking_uuid>`;
-the frontend resolves it against its own origin, so links never contain credentials.
+configuration. `can_join` includes those checks. Eligible staff/OTP responses include the
+passcode in `join_path`; guest responses omit it. The frontend resolves the path against its own origin.
 
 POST needs no body and derives all identities and claims from current database records.
 It returns `token`, `session_name`, `session_key`, `display_name`, `role` (`host` or
@@ -105,8 +133,10 @@ including errors, use `Cache-Control: no-store`.
 Bookings are eligible only with a practitioner resource and an active assigned user, an
 availability under a video-enabled schedule, a valid slot interval and status `booked`,
 `arrived`, `checked_in` or `in_consultation`. Issuance opens
-15 minutes before slot start and closes 60 minutes after slot end, including both exact boundary
-instants. Soft-deleted booking, patient, slot, resource, facility, assigned user and any present
+at midnight on the slot's start date in CARE's timezone (`Asia/Kolkata` in this workspace) and
+closes 60 minutes after slot end, including both exact boundary instants. Staff, OTP patients
+and passcode guests can therefore join earlier on the appointment day. Soft-deleted booking,
+patient, slot, resource, facility, assigned user and any present
 availability/schedule are rejected with 404. Non-practitioner resources also return 404. Unrelated patient phones also receive 404.
 Unauthorized staff receive 403, state/window failures 400, missing configuration 503.
 
@@ -128,7 +158,9 @@ credentials. It covers authorized roles, unrelated phones and staff, shared fami
 expired/invalid/wrong token types, all appointment statuses, exact issuance boundaries,
 soft-deleted scheduling relationships, missing/inactive practitioner, absent encounter,
 rejected missing availability and in-person schedules, reassignment, rescheduled links,
-server-derived claims, signing and no appointment mutation. Schedule tests cover separate
+server-derived claims, signing and no appointment status mutation. Guest coverage includes
+passcode creation/backfill, stable links, malformed/wrong/cross-booking credentials, participant-only
+claims, status/window/deletion checks and preservation of other metadata. Schedule tests cover separate
 read/write permissions, strict booleans, facility scoping and preservation of other metadata.
 The explicit DEBUG-only local seed opts in only its synthetic Zoom fixture schedule.
 

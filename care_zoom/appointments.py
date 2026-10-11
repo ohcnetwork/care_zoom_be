@@ -1,14 +1,43 @@
 """Stateless appointment eligibility and Zoom Video SDK authorization."""
 
 from datetime import timedelta
+from secrets import token_urlsafe
 from uuid import NAMESPACE_URL, uuid5
 
 import jwt
+from django.db import transaction
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError
 
+from care.emr.models.scheduling.booking import TokenBooking
 from care_zoom.settings import plugin_settings
 
 ALLOWED_STATUSES = {"booked", "arrived", "checked_in", "in_consultation"}
+
+
+def meeting_passcode(booking):
+    meta = booking.meta
+    config = meta.get("care_zoom") if isinstance(meta, dict) else None
+    value = config.get("meeting_passcode") if isinstance(config, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def ensure_meeting_passcode(booking):
+    if passcode := meeting_passcode(booking):
+        return passcode
+    # Old bookings and schedules enabled later need a stable link too.
+    with transaction.atomic():
+        booking = TokenBooking.objects.select_for_update().get(pk=booking.pk)
+        if passcode := meeting_passcode(booking):
+            return passcode
+        if not isinstance(booking.meta, dict) or not isinstance(
+            booking.meta.get("care_zoom", {}), dict
+        ):
+            raise ValidationError("Appointment metadata must contain JSON objects.")
+        passcode = token_urlsafe(32)
+        booking.meta.setdefault("care_zoom", {})["meeting_passcode"] = passcode
+        booking.save(update_fields=["meta"])
+        return passcode
 
 
 def configured():
@@ -30,7 +59,9 @@ def eligibility(booking, now=None):
     now = now or timezone.now()
     slot = booking.token_slot
     resource = slot.resource
-    opens = slot.start_datetime - timedelta(minutes=15)
+    opens = timezone.localtime(slot.start_datetime).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     closes = slot.end_datetime + timedelta(minutes=60)
     reason = None
     if resource.resource_type != "practitioner" or not resource.user_id:
